@@ -68,8 +68,6 @@ class CommsPerformanceModel:
         return self.predict([sku], [collectives], [world_size], [buffer_size], [param_dtype])[0]
 
 # local test codes
-
-
 class ExecutionEnvironment:
     def __init__(self, local_gpu_count: int, total_host_count: int, sku: str) -> None:
         self.local_gpu_count = local_gpu_count
@@ -164,7 +162,10 @@ class OSDPExecutionSimulator:
         self.comms_perf_model = comms_perf_model
         self.compute_perf_model = compute_perf_model
 
-    # latency (s), memory (gib)
+    # Given an execution environment, 
+    # use the learned communication performance model
+    # and the profiled compute performance model to derive a performance estimation
+    # returns latency (s), memory (gib)
     def simulate(self, exec_env: ExecutionEnvironment) -> Tuple[float, float]:
         # assume single comms stream
         # assume single comp stream
