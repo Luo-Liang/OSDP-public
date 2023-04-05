@@ -10,7 +10,7 @@ The sim is needed because launching distributed jobs are too slow - this surroga
 
 The core of the OSDP performance model is similar to the one used in Srifty:
 
-Luo, L., West, P., Patel, P., Krishnamurthy, A. and Ceze, L., 2022. SRIFTY: Swift and Thrifty Distributed Neural Network Training on the Cloud. Proceedings of Machine Learning and Systems, 4, pp.833-847.
+`Luo, L., West, P., Patel, P., Krishnamurthy, A. and Ceze, L., 2022. SRIFTY: Swift and Thrifty Distributed Neural Network Training on the Cloud. Proceedings of Machine Learning and Systems, 4, pp.833-847.`
 
 Output = 
 A list of ShardingStrategy which corresponds to the optimal FSDP shardingstrategy given a list of modules (abstracted as a serialized list of execution information).
