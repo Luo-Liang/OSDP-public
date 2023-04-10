@@ -1,5 +1,6 @@
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
+import sys
 from typing import ClassVar, List, Optional, Tuple
 import pandas
 import sklearn
@@ -7,6 +8,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OneHotEncoder
 from torch.distributed.fsdp.api import ShardingStrategy
+from sortedcontainers import SortedList
 
 # HW_SKU, COLLECTIVE_NAME, BUFFER_SIZE, LATENCY
 # SMC, REDUCE_SCATTER, 16384, scipy-tabular data
@@ -17,6 +19,8 @@ dtype2size = {
 }
 
 # feel free to overfit
+
+
 class CommsPerformanceModel:
     @staticmethod
     def get_model_schema():
@@ -68,6 +72,8 @@ class CommsPerformanceModel:
         return self.predict([sku], [collectives], [world_size], [buffer_size], [param_dtype])[0]
 
 # local test codes
+
+
 class ExecutionEnvironment:
     def __init__(self, local_gpu_count: int, total_host_count: int, sku: str) -> None:
         self.local_gpu_count = local_gpu_count
@@ -88,11 +94,30 @@ class ExecutionEnvironment:
 
     def get_allreduce_world_size(self, sharding_strategy: ShardingStrategy) -> float:
         if sharding_strategy == ShardingStrategy.NO_SHARD:
-            return 0
+            return 1
         elif sharding_strategy == ShardingStrategy.FULL_SHARD or sharding_strategy == ShardingStrategy.SHARD_GRAD_OP:
-            return 0
+            return 1
         else:
             return float(self.total_host_count)
+
+
+class list_of_tuple_with_pos_idx(list):
+    def __init__(self, max_idx, *args, **kwargs) -> None:
+        self.max_idx = max_idx
+        super().__init__(*args, **kwargs)
+
+    def append(self, item):
+        assert type(item) is tuple
+        _, idx = item
+        if idx < 0 or idx > self.max_idx:
+            # invalid
+            return
+        else:
+            super().append(item)
+
+
+def n_minus_1_over_n(n):
+    return (n - 1) / n
 
 
 @dataclass
@@ -110,42 +135,31 @@ class ModuleExecutionDescriptor:
     def get_idle_memory_usage(self, exec_env: ExecutionEnvironment) -> float:
         return dtype2size[self.param_dtype] * self.param_count / exec_env.get_allgather_reducescatter_world_size(self.sharding_strategy)
 
-    def get_activation_memory_usage(self, exec_env: ExecutionEnvironment) -> float:
-        return dtype2size[self.param_dtype] * self.activation_count
+    def needs_allgather_forward(self):
+        return self.sharding_strategy != ShardingStrategy.NO_SHARD
 
-    def get_active_to_inactive_weight_memory_delta_fwd(self, exec_env: ExecutionEnvironment) -> float:
-        if self.sharding_strategy == ShardingStrategy.NO_SHARD or self.sharding_strategy == ShardingStrategy._HYBRID_SHARD_ZERO2 or self.sharding_strategy == ShardingStrategy.SHARD_GRAD_OP:
-            return 0  # Zero2 retains memory weights. No memory transition
-        else:
-            # free weights memory
+    def needs_allgather_backward(self):
+        return self.sharding_strategy == ShardingStrategy.FULL_SHARD or self.sharding_strategy == ShardingStrategy.HYBRID_SHARD
+
+    def needs_reduce_scatter_backward(self):
+        return self.sharding_strategy != ShardingStrategy.NO_SHARD
+
+    def needs_allreduce_backward(self):
+        return self.sharding_strategy == ShardingStrategy.HYBRID_SHARD or self.sharding_strategy == ShardingStrategy._HYBRID_SHARD_ZERO2 or self.sharding_strategy == ShardingStrategy.NO_SHARD
+
+    def _weights_memory_delta(self):
+        if self.needs_allgather_forward():
             world_size = exec_env.get_allgather_reducescatter_world_size(
                 self.sharding_strategy)
-            return dtype2size[self.param_dtype] * self.param_count * (world_size - 1) / world_size
-
-    def get_inactive_to_active_weight_memory_delta_fwd(self, exec_env: ExecutionEnvironment) -> float:
-        # requires allgather, unless you're noshard
-        if self.sharding_strategy == ShardingStrategy.NO_SHARD:
+            return self.param_count * dtype2size[self.param_dtype] * n_minus_1_over_n(world_size)
+        else:
             return 0
-        else:
-            # gathers remote memory
-            world_size = exec_env.get_allgather_reducescatter_world_size(
-                self.sharding_strategy)
-            return dtype2size[self.param_dtype] * self.param_count * (world_size - 1) / world_size
+        
+    def _activation_memory_delta(self):
+        return self.activation_count * dtype2size[self.param_dtype]
 
-    def get_active_to_inactive_weight_memory_delta_bwd(self, exec_env: ExecutionEnvironment) -> float:
-        # only noshard frees no memory
-        if self.sharding_strategy == ShardingStrategy.NO_SHARD:
-            return 0
-        else:
-            world_size = exec_env.get_allgather_reducescatter_world_size(
-                self.sharding_strategy)
-            return dtype2size[self.param_dtype] * self.param_count * (1 - 1 / world_size)
-
-    def get_inactive_to_active_weight_memory_delta_bwd(self, exec_env: ExecutionEnvironment) -> float:
-        if self.sharding_strategy == ShardingStrategy.NO_SHARD or self.sharding_strategy == ShardingStrategy._HYBRID_SHARD_ZERO2 or self.sharding_strategy == ShardingStrategy.SHARD_GRAD_OP:
-            return 0  # ZERO2 retains memory weights
-        else:
-            return dtype2size[self.param_dtype] * self.param_count * (1 - 1 / exec_env.get_allgather_reducescatter_world_size(self.sharding_strategy))
+    def _gradient_memory_delta(self):
+        return self._activation_memory_delta()
 
     dbg__layer_variable: ClassVar[int] = 0
 
@@ -161,112 +175,298 @@ class OSDPExecutionSimulator:
     def __init__(self, comms_perf_model: CommsPerformanceModel, compute_perf_model: List[ModuleExecutionDescriptor]):
         self.comms_perf_model = comms_perf_model
         self.compute_perf_model = compute_perf_model
+        self.dummy_event = None
 
-    # Given an execution environment, 
+    def get_latency(self, exec_env: ExecutionEnvironment, bundle: Tuple[str, ModuleExecutionDescriptor]):
+        if bundle == self.dummy_event:
+            return sys.maxsize
+
+        task_type, exec_desc = bundle
+        if "compute" in task_type:
+            return exec_desc.latency
+        elif "optimizer" in task_type:
+            world_size = exec_env.get_allgather_reducescatter_world_size(
+                exec_desc.sharding_strategy)
+            return exec_desc.full_optimizer_latency / world_size
+        elif "allreduce" in task_type:
+            return self.comms_perf_model.predict_single(exec_env.sku, "allreduce", exec_env.get_allgather_reducescatter_world_size(exec_desc.sharding_strategy), exec_desc.param_count, exec_desc.param_dtype)
+        else:
+            collectives_name = task_type.split(";")[0]
+            return self.comms_perf_model.predict_single(exec_env.sku, collectives_name, exec_env.get_allgather_reducescatter_world_size(exec_desc.sharding_strategy), exec_desc.param_count, exec_desc.param_dtype)
+
+    # Given an execution environment,
     # use the learned communication performance model
     # and the profiled compute performance model to derive a performance estimation
     # returns latency (s), memory (gib)
-    def simulate(self, exec_env: ExecutionEnvironment) -> Tuple[float, float]:
+    def simulate(self, exec_env: ExecutionEnvironment, backward_prefetch: bool = False, limit_allgather: int = 1000) -> Tuple[float, float]:
         # assume single comms stream
         # assume single comp stream
         # assume very fast CPU
         # assume prefetcher is on
 
-        comp_ts = 0 # time ticks at which the compute stream is ready to take new task
-        comm_ts = 0 # time ticks at which the communication stream is ready to take new task
+        TASKTYPE_ALLGATHER_FWD = "allgather:fwd"
+        TASKTYPE_COMPUTE_FWD = "compute:fwd"
+        TASKTYPE_ALLGATHER_BWD = "allgather:bwd"
+        TASKTYPE_COMPUTE_BWD = "compute:bwd"
+        TASKTYPE_REDUCESCATTER_BWD = "reduce_scatter:Bwd"
+        TASKTYPE_ALLREDUCE_BWD = "allreduce:bwd"
+        TASKTYPE_OPTIMIZER = "optimizer"
 
-        activation_memory = 0
-        weights_memory = sum(desc.get_idle_memory_usage(exec_env)
-                             for desc in self.compute_perf_model)  # base memory usage
-        optimizer_memory = 2 * weights_memory  # ADAM-style
-        gradient_memory = 0
+        TASKSTREAM_COMPUTE = "compute_stream"
+        TASKSTREAM_COMMS = "comms_stream"
 
-        # ignores collective memory - assume the collectives directly takes from the original tensor.
+        # first, gather all tasks
+        deps = defaultdict(lambda: list_of_tuple_with_pos_idx(
+            max_idx=len(self.compute_perf_model) - 1))
+        # on the forward pass, for each compute,
+        # create at most one allgather task
 
-        max_memory_usage = activation_memory + \
-            weights_memory + optimizer_memory + gradient_memory
-        
-        # maximum memory usage is the sum of idle memory at this point
-        # forward pass:
+        # first, build dependency graph and use the actual
+        # event serialization in the current FSDP's impl
+
+        compute_stream = list_of_tuple_with_pos_idx()
+        comms_stream = list_of_tuple_with_pos_idx()
+
         for idx, exec_desc in enumerate(self.compute_perf_model):
-            if exec_desc.sharding_strategy != ShardingStrategy.NO_SHARD:
-                world_size = exec_env.get_allgather_reducescatter_world_size(
-                    exec_desc.sharding_strategy)
+            comp_task = (TASKTYPE_COMPUTE_FWD, idx)
+            allgather_task = (TASKTYPE_ALLGATHER_FWD, idx)
+            reduce_scatter_task = (TASKTYPE_REDUCESCATTER_BWD, idx)
+            comp_bwd_task = (TASKTYPE_COMPUTE_BWD, idx)
+            allgather_bwd_task = (TASKTYPE_ALLGATHER_BWD, idx)
+            allreduce_task = (TASKTYPE_ALLREDUCE_BWD, idx)
 
-                comm_lat = self.comms_perf_model.predict_single(
-                    exec_env.sku, "allgather", world_size, exec_desc.param_count, exec_desc.param_dtype
-                )
-                comm_ts += comm_lat
-                # allgather for layer idx will finish at comm_ts
+            prev_comp_task = (TASKTYPE_COMPUTE_FWD, idx - 1)
+            # prev_allgather_task = (TASKTYPE_ALLGATHER_FWD, idx - 1)
+            # next_allgather_task_bwd = (TASKTYPE_ALLGATHER_BWD, idx + 1)
+            next_comp_task_bwd = (TASKTYPE_COMPUTE_BWD, idx + 1)
 
-            # compute stream will start compute layer idx 
-            # when comm for layer idx is finished and when the compute stream is idle
-            comp_ts = max(comp_ts, comm_ts) + exec_desc.latency
+            optimizer_task = (TASKTYPE_OPTIMIZER, idx)
+            # forward
+            if exec_desc.needs_allgather_forward():
+                # needs to finish allgather before compute can happen
+                deps[comp_task].append(allgather_task)
+                # provides serialization for comms stream
+                comms_stream.append(allgather_task)
 
-            # compute memory watermarks
-            activation_memory += exec_desc.get_activation_memory_usage(
-                exec_env)
-            # full parameter size
-            weights_memory += exec_desc.get_inactive_to_active_weight_memory_delta_fwd(
-                exec_env)
-            max_memory_usage = max(max_memory_usage, activation_memory +
-                                   weights_memory + optimizer_memory + gradient_memory)
+            # depends on previous compute
+            # true dependency
+            deps[comp_task].append(prev_comp_task)
 
-            weights_memory -= exec_desc.get_active_to_inactive_weight_memory_delta_fwd(
-                exec_env)
+            # backward
+            # current compute depends on next layer's compute
+            deps[comp_bwd_task].append(next_comp_task_bwd)
 
-        # backward
-        # set communication tick to the end of compute
-        # note compute always finishes after comms in the forward pass.
-        comm_ts = comp_ts
+            if exec_desc.needs_allgather_backward():
+                # if current layer also needs allgather
+                deps[comp_bwd_task].append(allgather_bwd_task)
 
+            if exec_desc.needs_reduce_scatter_backward():
+                deps[reduce_scatter_task].append(comp_bwd_task)
+
+            if exec_desc.needs_allreduce_backward():
+                if exec_desc.sharding_strategy == ShardingStrategy.NO_SHARD:
+                    # ddp
+                    deps[allreduce_task].append(comp_bwd_task)
+                else:
+                    # hybrid shard
+                    deps[allreduce_task].append(reduce_scatter_task)
+
+            # hook up dependency for optimizer
+            deps[optimizer_task].append(comp_bwd_task)
+
+            # provide serialization for the forward pass compute
+            compute_stream.append(comp_task)
+
+        # provide serialization for backward
         for idx in range(len(self.compute_perf_model) - 1, -1, -1):
+            # backward
             exec_desc = self.compute_perf_model[idx]
-            world_size = exec_env.get_allgather_reducescatter_world_size(
-                exec_desc.sharding_strategy)
+            comp_task = (TASKTYPE_COMPUTE_FWD, idx)
+            allgather_task = (TASKTYPE_ALLGATHER_FWD, idx)
+            reduce_scatter_task = (TASKTYPE_REDUCESCATTER_BWD, idx)
+            comp_bwd_task = (TASKTYPE_COMPUTE_BWD, idx)
+            allgather_bwd_task = (TASKTYPE_ALLGATHER_BWD, idx)
+            allreduce_task = (TASKTYPE_ALLREDUCE_BWD, idx)
+            next_allgather_task = (TASKTYPE_ALLGATHER_BWD, idx)
+            # special handle prefetch
+            comms_stream.append(allgather_bwd_task)
+            if backward_prefetch and idx == 0:
+                # issue one more allgather
+                comms_stream.append(next_allgather_task)
 
-            if exec_desc.sharding_strategy == ShardingStrategy.FULL_SHARD or exec_desc.sharding_strategy == ShardingStrategy.HYBRID_SHARD:
-                # I need allgather?
-                allgather_lat = self.comms_perf_model.predict_single(
-                    exec_env.sku, "allgather", world_size, exec_desc.param_count, exec_desc.param_dtype)
-                comm_ts += allgather_lat
+            # issue reducescatter for this layer if needed
+            if exec_desc.needs_reduce_scatter_backward():
+                comms_stream.append(reduce_scatter_task)
 
-            # execute
-            weights_memory += exec_desc.get_inactive_to_active_weight_memory_delta_bwd(
-                exec_env)
-            gradient_memory += exec_desc.get_idle_memory_usage(exec_env)
-            max_memory_usage = max(max_memory_usage, activation_memory +
-                                   weights_memory + optimizer_memory + gradient_memory)
-            
-            comp_ts = max(comp_ts, comm_ts) + exec_desc.latency
-            # release weight memory if needed
-            weights_memory -= exec_desc.get_inactive_to_active_weight_memory_delta_bwd(
-                exec_env)
+            # issue allreduce for this layer if needed
+            if exec_desc.needs_allreduce_backward():
+                comms_stream.append(allreduce_task)
 
-            # issue reducescatter if needed.
-            if exec_desc.sharding_strategy != ShardingStrategy.NO_SHARD:
-                rs_lat = self.comms_perf_model.predict_single(
-                    exec_env.sku, "reduce_scatter", world_size, exec_desc.param_count, exec_desc.param_dtype)
-                # reducescatter for layer idx cannot happen before this layer's compute.
-                comm_ts = max(comm_ts, comp_ts) + rs_lat
+            # because in reality we run the optimizer together
+            # the order of execution does not matter.
+            compute_stream.append(optimizer_task)
 
-            # issue allreduce if needed
-            if exec_desc.sharding_strategy == ShardingStrategy.HYBRID_SHARD or exec_desc.sharding_strategy == ShardingStrategy._HYBRID_SHARD_ZERO2:
-                ar_lat = self.comms_perf_model.predict_single(
-                    exec_env.sku, "allreduce", world_size, exec_desc.param_count, exec_desc.param_dtype)
-                # allreduce can happen right after reducescatter
-                comm_ts += ar_lat
+        # then, queue optimizer tasks
+        for idx in range(len(self.compute_perf_model) - 1, -1, -1):
+            optimizer_task = (TASKTYPE_OPTIMIZER, idx)
+            compute_stream.append(optimizer_task)
 
-        # compute optimizer latency
-        # assuming latency is porportional to # of parameters locally.
-        opt_lat = 0
-        for exec_desc in self.compute_perf_model:
-            world_size = exec_env.get_allgather_reducescatter_world_size(
-                exec_desc.sharding_strategy)
-            opt_lat = exec_desc.full_optimizer_latency / world_size
+        # now compute and comms stream represent a
+        # real world serialization for the dependency we have.
+        # the final step is to really simulate them
+
+        # note that as long as the comms stream is nonempty, the process isn't done and won't deadlock
+        finish_time = {}
+        pending_allgathers_fwd = 0
+        # active_tasks = defaultdict(lambda: 0)
+
+        def get_task_stream(task):
+            task_name = task[0]
+            if "compute" in task_name or "optimizer" in task_name:
+                return TASKSTREAM_COMPUTE
+            else:
+                return TASKSTREAM_COMMS
+
+        # a task is scheduable iff
+        # (1) the task has all explicit dependencies resolved
+        # (2) the task has all implicit dependencies resolved (single stream semantics)
+        # (3) additional constraints such as number of inflight allgathers
+        def schedulable(task):
+            if task == self.dummy_event:
+                return False
+
+            ready = True
+            for dep in deps[task]:
+                if dep not in finish_time:
+                    ready = False
+                    break
+
+            task_type = task[0]
+            if "allgather" in task_type and pending_allgathers_fwd >= limit_allgather:
+                # cannot schedule more than allowed pending allgathers
+                return False
+
+            return ready
+
+        # this is a general implementation, for single stream execution this is not needed
+        timeline = SortedList()
+        curr_time = 0
+        EVENT_SCHEDULED = 2
+        EVENT_START = 1
+        EVENT_END = 0  # prioritize end events
+
+        # event-based memory profiling hooks
+        ACTIVATION_MEMORY = "activation_memory"
+        WEIGHTS_MEMORY = "weights_memory"
+        OPTIMIZER_MEMORY = "optimizer_memory"
+        GRADIENT_MEMORY = "gradient_memory"
+
+        memory_profile = {
+            ACTIVATION_MEMORY: 0,
+            WEIGHTS_MEMORY: sum(desc.get_idle_memory_usage(exec_env) for desc in self.compute_perf_model),
+            OPTIMIZER_MEMORY: 2 * sum(desc.get_idle_memory_usage(exec_env) for desc in self.compute_perf_model),
+            GRADIENT_MEMORY: 0,
+        }
+
+        # provide transition actions for all of the following:
+        # TASKTYPE_ALLGATHER_FWD = "allgather:fwd"
+        # TASKTYPE_COMPUTE_FWD = "compute:fwd"
+        # TASKTYPE_ALLGATHER_BWD = "allgather:bwd"
+        # TASKTYPE_COMPUTE_BWD = "compute:bwd"
+        # TASKTYPE_REDUCESCATTER_BWD = "reduce_scatter:Bwd"
+        # TASKTYPE_ALLREDUCE_BWD = "allreduce:bwd"
+        # TASKTYPE_OPTIMIZER = "optimizer"
+
+        max_memory_usage = sum(memory_profile.values())
+
+        def event_no_op(exec_desc):
+            pass
+
+        def _record_memory_footprint():
+            nonlocal max_memory_usage
+            max_memory_usage = max(
+                max_memory_usage, sum(memory_profile.values()))
+
+        def event_start_allgather(exec_desc):
+            memory_profile[WEIGHTS_MEMORY] += exec_desc._weights_memory_delta()
+            _record_memory_footprint()
+
+        def event_start_compute(exec_desc):
+            memory_profile[ACTIVATION_MEMORY] += exec_desc._activation_memory_delta()
+            _record_memory_footprint()
+
+        def event_end_reduce_scatter(exec_desc):
+            memory_profile[WEIGHTS_MEMORY] -= exec_desc._weights_memory_delta()
+            _record_memory_footprint()
+
+        def event_start_compute_bwd(exec_desc):
+            memory_profile[ACTIVATION_MEMORY] += exec_desc._gradient_memory_delta
+            _record_memory_footprint()
+
+        memory_profiler_hooks = defaultdict(lambda: event_no_op)
+
+        # when does weight memory increase?
+        # when allgather is scheduled (acquire) fwd, bwd,
+        memory_profiler_hooks[(
+            EVENT_SCHEDULED, TASKTYPE_ALLGATHER_FWD)] = event_start_allgather
+        memory_profiler_hooks[(
+            EVENT_SCHEDULED, TASKTYPE_ALLGATHER_BWD)] = event_start_allgather
+        
+        # when does weight memory decrease?
+        # when reducescatter has finished running
+        memory_profiler_hooks[(EVENT_END, TASKTYPE_REDUCESCATTER_BWD)] = event_end_reduce_scatter
+
+        # when does activation memory increase?
+        # when compute fwd is active
+        memory_profiler_hooks[(EVENT_START, TASKTYPE_COMPUTE_FWD)] = event_start_compute
+
+        # when does gradient memory increase?
+        # when backward compute is active
+        memory_profiler_hooks[(EVENT_START, TASKTYPE_COMPUTE_BWD)] = event_start_compute_bwd
+        
+
+        while comms_stream or compute_stream or timeline:
+            # any task already queued?
+            if timeline:
+                curr_time, event_status, curr_task = timeline.pop(0)
+                done_task_type, task_idx = curr_task
+                if "allgather" in done_task_type:
+                    if event_status == EVENT_START:
+                        pending_allgathers_fwd += 1
+                    else:
+                        pending_allgathers_fwd -= 1
+
+                # is this a start event?
+                # if so, queue an event end
+                if event_status == EVENT_START:
+                    timeline.add(
+                        curr_time + self.get_latency(exec_env, curr_task), EVENT_END, curr_task)
+                    memory_profiler_hooks[(EVENT_START, curr_task)]()
+
+                else:
+                    # mark this task as done
+                    finish_time[curr_task] = curr_time
+                    memory_profiler_hooks[(EVENT_END, curr_task)]()
+
+            while compute_stream and schedulable(compute_stream[0]):
+                # issue at most one task per single stream semantics
+                # i can schedule it and I know when it finishes
+                comp_task = compute_stream.pop(0)
+                memory_profiler_hooks[(EVENT_SCHEDULED, comp_task)]()
+                timeline.add(
+                    (curr_time, EVENT_START, comp_task))
+
+            while comms_stream and schedulable(comms_stream[0]):
+                # issue at most one task per single stream semantics
+                # issue as many comms tasks as possible
+                comms_task = comms_task.pop(0)
+                memory_profiler_hooks[(EVENT_SCHEDULED, comms_task)]()
+                timeline.add(
+                    (curr_time, EVENT_END, comms_task)
+                )
 
         # optimizer and backward has a bogus dependency.
-        return max(comm_ts, comp_ts) + opt_lat, max_memory_usage
+        return curr_time, max_memory_usage
 
 
 ### LOCAL TESTS ###
