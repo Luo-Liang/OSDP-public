@@ -127,6 +127,7 @@ class ModuleExecutionDescriptor:
     activation_dtype: str = "float"
     param_count: int = 0
     latency: float = 0
+    backward_latency: float = 0
     sharding_strategy: ShardingStrategy = ShardingStrategy.NO_SHARD
     full_optimizer_latency: float = 0
     optimizer_memory: float = 0  # gb
@@ -168,7 +169,7 @@ class ModuleExecutionDescriptor:
         ModuleExecutionDescriptor.dbg__layer_variable += 1
         import random
         return ModuleExecutionDescriptor(
-            f"layer_{ModuleExecutionDescriptor.dbg__layer_variable}", random.randint(10, 100), "float", random.randint(10, 100), random.randint(10, 100), ShardingStrategy.NO_SHARD, random.randint(0, 100), random.randint(0, 100), "float")
+            f"layer_{ModuleExecutionDescriptor.dbg__layer_variable}", random.randint(10, 100), "float", random.randint(10, 100), random.randint(10, 100), random.randint(10, 100), random.choice([x for x in ShardingStrategy]), random.randint(0, 100), random.randint(0, 100), "float")
 
 
 class OSDPExecutionSimulator:
@@ -183,8 +184,10 @@ class OSDPExecutionSimulator:
 
         task_type, exec_desc_idx = bundle
         exec_desc = self.compute_perf_model[exec_desc_idx]
-        if "compute" in task_type:
+        if "compute:fwd" in task_type:
             return exec_desc.latency
+        elif "compute:bwd" in task_type:
+            return exec_desc.backward_latency
         elif "optimizer" in task_type:
             world_size = exec_env.get_allgather_reducescatter_world_size(
                 exec_desc.sharding_strategy)
@@ -229,6 +232,11 @@ class OSDPExecutionSimulator:
             len(self.compute_perf_model) - 1)
         comms_stream = list_of_tuple_with_pos_idx(
             len(self.compute_perf_model) - 1)
+
+        named_streams = {
+            TASKSTREAM_COMMS: comms_stream,
+            TASKSTREAM_COMPUTE: compute_stream
+        }
 
         for idx, exec_desc in enumerate(self.compute_perf_model):
             comp_task = (TASKTYPE_COMPUTE_FWD, idx)
@@ -278,7 +286,7 @@ class OSDPExecutionSimulator:
                 else:
                     # hybrid shard
                     deps[allreduce_task].append(reduce_scatter_task)
-                
+
                 deps[optimizer_task].append(allreduce_task)
 
             # hook up dependency for optimizer
@@ -302,11 +310,11 @@ class OSDPExecutionSimulator:
                 prefetch_idx = idx - 1
                 while backward_prefetch > 0 and idx == len(self.compute_perf_model) - 1 and prefetch_idx >= 0 and self.compute_perf_model[prefetch_idx].needs_allgather_backward():
                     # issue one more allgather
-                    next_allgather_task = (TASKTYPE_ALLGATHER_BWD, prefetch_idx)
+                    next_allgather_task = (
+                        TASKTYPE_ALLGATHER_BWD, prefetch_idx)
                     comms_stream.append(next_allgather_task)
                     backward_prefetch -= 1
                     prefetch_idx -= 1
-
 
             # issue reducescatter for this layer if needed
             if exec_desc.needs_reduce_scatter_backward():
@@ -321,6 +329,11 @@ class OSDPExecutionSimulator:
         # then, queue optimizer tasks
         for idx in range(len(self.compute_perf_model) - 1, -1, -1):
             optimizer_task = (TASKTYPE_OPTIMIZER, idx)
+            exec_desc_0 = self.compute_perf_model[0]
+            # if exec_desc_0.needs_allreduce_backward():
+            #     deps[optimizer_task].append((TASKTYPE_ALLREDUCE_BWD, 0))
+            # elif exec_desc_0.needs_reduce_scatter_backward():
+            #     deps[optimizer_task].append((TASKTYPE_REDUCESCATTER_BWD, 0))
             compute_stream.append(optimizer_task)
 
         # now compute and comms stream represent a
@@ -438,11 +451,11 @@ class OSDPExecutionSimulator:
                 return TASKSTREAM_COMMS
 
         def get_earliest_possible_schedule_time(task, proposal):
-            print(
-                f"[???] probing for schedule time {task}. proposal = {proposal}")
+            # print(
+            #     f"[???] probing for schedule time {task}. proposal = {proposal}")
             for dep in deps[task]:
                 proposal = max(proposal, finish_time[dep])
-                print(f"    dep: {dep}, finished = {finish_time[dep]}")
+                # print(f"    dep: {dep}, finished = {finish_time[dep]}")
 
             return proposal
 
@@ -454,77 +467,86 @@ class OSDPExecutionSimulator:
         print(f"comms stream = {comms_stream}")
         print(f"comps stream = {compute_stream}")
 
-        timeline = SortedList()
+        issue_q_order_tiebreaker = 0
 
-        while comms_stream or compute_stream or timeline:
-            # any task already queued?
-            if timeline:
-                # timeline is an arbitrary serialization of
-                # execution of compute and comms stream.
-                schedule_ts, event_status, curr_task = timeline.pop(0)
-                done_task_type, _ = curr_task
-                if "allgather" in done_task_type:
-                    if event_status == EVENT_START:
-                        pending_allgathers_fwd += 1
-                    else:
-                        pending_allgathers_fwd -= 1
+        active_tasks = defaultdict(lambda: deque())
+        scheduled_tasks = defaultdict(lambda: deque())
+        timestamps = defaultdict(lambda: 0)  # global time
 
-                # is this a start event?
-                # if so, queue an event end
-                if event_status == EVENT_START:
-                    # catch up with global clock
-                    start_time = max(timestamps[get_task_stream(
-                        curr_task)], schedule_ts)
+        global_memory_profiling_timeline = SortedList()
 
-                    end_time = start_time + self.get_latency(exec_env, curr_task)
-
-                    timeline.add(
-                        (start_time + self.get_latency(exec_env, curr_task), EVENT_END, curr_task))
-                    memory_profiler_hooks[(EVENT_START, curr_task)](curr_task)
-                    # advance time stamp, because i know this stream
-                    # cannot do anything else between now and now + latency
-                    # advance my time so my task is not "preempted"
-                    print(f"[{start_time}] {curr_task} started. Will finish at {end_time}")
-
-                    timestamps[get_task_stream(
-                        curr_task)] = end_time
-
-                else:
-                    # mark this task as done
-                    finish_time[curr_task] = timestamps[get_task_stream(
-                        curr_task)]
-                    memory_profiler_hooks[(EVENT_END, curr_task)](curr_task)
-
+        # if any unsecheduled, active, or scheduled but unrun tasks
+        # remaining, do this loop.
+        while comms_stream or compute_stream or any(val for val in active_tasks.values()) or any(val for val in scheduled_tasks.values()):
+            # print(
+            #     f"comms_stream = {comms_stream}, comp_stream = {compute_stream}, active = {active_tasks}, sched = {scheduled_tasks}")
+            # tasks that is already running have highest priority
+            # find tasks
+            for selected_stream in [TASKSTREAM_COMMS, TASKSTREAM_COMPUTE]:
+                # already something running on this stream
+                if active_tasks[selected_stream]:
+                    # advance global clock
+                    current_time, curr_task = active_tasks[selected_stream].popleft(
+                    )
+                    finish_time[curr_task] = current_time
+                    global_memory_profiling_timeline.add(
+                        (current_time, issue_q_order_tiebreaker,
+                         (EVENT_END, curr_task))
+                    )
+                    issue_q_order_tiebreaker += 1
+                    timestamps[selected_stream] = current_time
                     print(
-                        f"[{timestamps[get_task_stream(curr_task)]}] {curr_task} finished.")
+                        f"[{current_time}][{selected_stream}] task {curr_task} finished")
+                    # otherwise, see if anything in the ready queue, if so, issue them.
+                elif scheduled_tasks[selected_stream]:
+                    # we can add to the corresponding queue
+                    schedule_time, curr_task = scheduled_tasks[selected_stream].popleft(
+                    )
+                    # if I'm starting a new task, I'm sure nothing currently
+                    # is running. This is simulating a stream can work at a single task at a time.
+                    # the clock now is whichever is later, my schedule time (in case when nothing is running when the task is scheduled) or timestamp, in which case something is running when the task is scheduled
+                    start_time = max(
+                        timestamps[selected_stream], schedule_time)
+                    # add to active task queue. This is when task runs
+                    end_time = start_time + \
+                        self.get_latency(exec_env, curr_task)
+                    active_tasks[selected_stream].append(
+                        (end_time, curr_task))
+                    global_memory_profiling_timeline.add(
+                        (end_time, issue_q_order_tiebreaker, (
+                            EVENT_START, curr_task))
+                    )
+                    issue_q_order_tiebreaker += 1
+                    print(
+                        f"[{start_time}][{selected_stream}] task {curr_task} started")
 
-            while compute_stream and schedulable(compute_stream[0]):
-                comp_task = compute_stream.pop(0)
-                memory_profiler_hooks[(EVENT_SCHEDULED, comp_task)](comp_task)
-                schedule_time = get_earliest_possible_schedule_time(
-                    comp_task, timestamps[TASKSTREAM_COMPUTE])
+                while named_streams[selected_stream] and schedulable(named_streams[selected_stream][0]):
+                    curr_task = named_streams[selected_stream].pop(0)
+                    # schedulable time is the latest time of my clock or my dependencies' clock
+                    schedule_time = get_earliest_possible_schedule_time(
+                        curr_task, timestamps[selected_stream])
 
-                print(
-                    f"[{schedule_time}] scheduled comp task {comp_task}")
+                    scheduled_tasks[selected_stream].append(
+                        (schedule_time, curr_task))
 
-                timeline.add(
-                    (schedule_time, EVENT_START, comp_task))
+                    global_memory_profiling_timeline.add(
+                        (schedule_time, issue_q_order_tiebreaker, (
+                            EVENT_SCHEDULED, curr_task))
+                    )
+                    print(
+                        f"[{schedule_time}][{selected_stream}] task {curr_task} started. ")
 
-            while comms_stream and schedulable(comms_stream[0]):
-                # issue as many comms tasks as possible
-                comms_task = comms_stream.pop(0)
-                memory_profiler_hooks[(EVENT_SCHEDULED, comms_task)](
-                    comms_task)
+                    issue_q_order_tiebreaker += 1
 
-                schedule_time = get_earliest_possible_schedule_time(
-                    comms_task, timestamps[TASKSTREAM_COMMS])
+        # next, compute memory usage
+        for log in global_memory_profiling_timeline:
+            event_time, _, event_entry = log
+            memory_profiler_hooks[event_entry](event_entry[1])
 
-                print(
-                    f"[{schedule_time}] scheduled comms task {comms_task}")
-
-                timeline.add(
-                    (schedule_time, EVENT_START, comms_task)
-                )
+            _dbg_stream_symbol = "[GPU ]" if get_task_stream(
+                event_entry[1]) == TASKSTREAM_COMPUTE else "[RoCE]"
+            print(
+                f"[{event_time}][{_dbg_stream_symbol}] {event_entry[0]} {event_entry[1]}")
 
         # optimizer and backward has a bogus dependency.
         return max(timestamps.values()), max_memory_usage
@@ -556,9 +578,11 @@ estimation = perf_model.predict(**dummy_prediction_input)
 # print(estimation)
 
 dummy_compute_perf_model = [
-    ModuleExecutionDescriptor.dbg__get_random_exec_desc() for _ in range(2)
+    ModuleExecutionDescriptor.dbg__get_random_exec_desc() for _ in range(3)
 ]
 
+for dummy_model in dummy_compute_perf_model:
+    dummy_model.sharding_strategy = ShardingStrategy.NO_SHARD
 
 sim = OSDPExecutionSimulator(perf_model, dummy_compute_perf_model)
 exec_env = ExecutionEnvironment(8, 16, "SMC")
