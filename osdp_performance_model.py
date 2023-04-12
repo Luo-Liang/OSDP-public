@@ -154,7 +154,7 @@ class ModuleExecutionDescriptor:
             return self.param_count * dtype2size[self.param_dtype] * n_minus_1_over_n(world_size)
         else:
             return 0
-        
+
     def _activation_memory_delta(self):
         return self.activation_count * dtype2size[self.param_dtype]
 
@@ -168,7 +168,7 @@ class ModuleExecutionDescriptor:
         ModuleExecutionDescriptor.dbg__layer_variable += 1
         import random
         return ModuleExecutionDescriptor(
-            f"layer_{ModuleExecutionDescriptor.dbg__layer_variable}", random.randint(10, 100), "float", random.randint(10, 100), random.randint(10, 100), random.choice([x for x in ShardingStrategy]), random.randint(0, 100), random.randint(0, 100), "float")
+            f"layer_{ModuleExecutionDescriptor.dbg__layer_variable}", random.randint(10, 100), "float", random.randint(10, 100), random.randint(10, 100), ShardingStrategy.NO_SHARD, random.randint(0, 100), random.randint(0, 100), "float")
 
 
 class OSDPExecutionSimulator:
@@ -177,11 +177,12 @@ class OSDPExecutionSimulator:
         self.compute_perf_model = compute_perf_model
         self.dummy_event = None
 
-    def get_latency(self, exec_env: ExecutionEnvironment, bundle: Tuple[str, ModuleExecutionDescriptor]):
+    def get_latency(self, exec_env: ExecutionEnvironment, bundle: Tuple[str, int]):
         if bundle == self.dummy_event:
             return sys.maxsize
 
-        task_type, exec_desc = bundle
+        task_type, exec_desc_idx = bundle
+        exec_desc = self.compute_perf_model[exec_desc_idx]
         if "compute" in task_type:
             return exec_desc.latency
         elif "optimizer" in task_type:
@@ -191,14 +192,14 @@ class OSDPExecutionSimulator:
         elif "allreduce" in task_type:
             return self.comms_perf_model.predict_single(exec_env.sku, "allreduce", exec_env.get_allgather_reducescatter_world_size(exec_desc.sharding_strategy), exec_desc.param_count, exec_desc.param_dtype)
         else:
-            collectives_name = task_type.split(";")[0]
+            collectives_name = task_type.split(":")[0]
             return self.comms_perf_model.predict_single(exec_env.sku, collectives_name, exec_env.get_allgather_reducescatter_world_size(exec_desc.sharding_strategy), exec_desc.param_count, exec_desc.param_dtype)
 
     # Given an execution environment,
     # use the learned communication performance model
     # and the profiled compute performance model to derive a performance estimation
     # returns latency (s), memory (gib)
-    def simulate(self, exec_env: ExecutionEnvironment, backward_prefetch: bool = False, limit_allgather: int = 1000) -> Tuple[float, float]:
+    def simulate(self, exec_env: ExecutionEnvironment, backward_prefetch: int = 1, limit_allgather: int = 1000) -> Tuple[float, float]:
         # assume single comms stream
         # assume single comp stream
         # assume very fast CPU
@@ -224,8 +225,10 @@ class OSDPExecutionSimulator:
         # first, build dependency graph and use the actual
         # event serialization in the current FSDP's impl
 
-        compute_stream = list_of_tuple_with_pos_idx()
-        comms_stream = list_of_tuple_with_pos_idx()
+        compute_stream = list_of_tuple_with_pos_idx(
+            len(self.compute_perf_model) - 1)
+        comms_stream = list_of_tuple_with_pos_idx(
+            len(self.compute_perf_model) - 1)
 
         for idx, exec_desc in enumerate(self.compute_perf_model):
             comp_task = (TASKTYPE_COMPUTE_FWD, idx)
@@ -239,6 +242,8 @@ class OSDPExecutionSimulator:
             # prev_allgather_task = (TASKTYPE_ALLGATHER_FWD, idx - 1)
             # next_allgather_task_bwd = (TASKTYPE_ALLGATHER_BWD, idx + 1)
             next_comp_task_bwd = (TASKTYPE_COMPUTE_BWD, idx + 1)
+            last_layer_compute = (TASKTYPE_COMPUTE_FWD,
+                                  len(self.compute_perf_model) - 1)
 
             optimizer_task = (TASKTYPE_OPTIMIZER, idx)
             # forward
@@ -255,13 +260,16 @@ class OSDPExecutionSimulator:
             # backward
             # current compute depends on next layer's compute
             deps[comp_bwd_task].append(next_comp_task_bwd)
+            deps[comp_bwd_task].append(last_layer_compute)
 
             if exec_desc.needs_allgather_backward():
-                # if current layer also needs allgather
+                # allgather backwad cannot happen before fwd of last layer
+                deps[allgather_bwd_task].append(last_layer_compute)
                 deps[comp_bwd_task].append(allgather_bwd_task)
 
             if exec_desc.needs_reduce_scatter_backward():
                 deps[reduce_scatter_task].append(comp_bwd_task)
+                deps[optimizer_task].append(reduce_scatter_task)
 
             if exec_desc.needs_allreduce_backward():
                 if exec_desc.sharding_strategy == ShardingStrategy.NO_SHARD:
@@ -270,9 +278,10 @@ class OSDPExecutionSimulator:
                 else:
                     # hybrid shard
                     deps[allreduce_task].append(reduce_scatter_task)
+                
+                deps[optimizer_task].append(allreduce_task)
 
             # hook up dependency for optimizer
-            deps[optimizer_task].append(comp_bwd_task)
 
             # provide serialization for the forward pass compute
             compute_stream.append(comp_task)
@@ -281,18 +290,23 @@ class OSDPExecutionSimulator:
         for idx in range(len(self.compute_perf_model) - 1, -1, -1):
             # backward
             exec_desc = self.compute_perf_model[idx]
-            comp_task = (TASKTYPE_COMPUTE_FWD, idx)
-            allgather_task = (TASKTYPE_ALLGATHER_FWD, idx)
             reduce_scatter_task = (TASKTYPE_REDUCESCATTER_BWD, idx)
             comp_bwd_task = (TASKTYPE_COMPUTE_BWD, idx)
             allgather_bwd_task = (TASKTYPE_ALLGATHER_BWD, idx)
             allreduce_task = (TASKTYPE_ALLREDUCE_BWD, idx)
-            next_allgather_task = (TASKTYPE_ALLGATHER_BWD, idx)
             # special handle prefetch
-            comms_stream.append(allgather_bwd_task)
-            if backward_prefetch and idx == 0:
-                # issue one more allgather
-                comms_stream.append(next_allgather_task)
+
+            # mimic backward prefetch
+            if exec_desc.needs_allgather_backward():
+                comms_stream.append(allgather_bwd_task)
+                prefetch_idx = idx - 1
+                while backward_prefetch > 0 and idx == len(self.compute_perf_model) - 1 and prefetch_idx >= 0 and self.compute_perf_model[prefetch_idx].needs_allgather_backward():
+                    # issue one more allgather
+                    next_allgather_task = (TASKTYPE_ALLGATHER_BWD, prefetch_idx)
+                    comms_stream.append(next_allgather_task)
+                    backward_prefetch -= 1
+                    prefetch_idx -= 1
+
 
             # issue reducescatter for this layer if needed
             if exec_desc.needs_reduce_scatter_backward():
@@ -302,9 +316,7 @@ class OSDPExecutionSimulator:
             if exec_desc.needs_allreduce_backward():
                 comms_stream.append(allreduce_task)
 
-            # because in reality we run the optimizer together
-            # the order of execution does not matter.
-            compute_stream.append(optimizer_task)
+            compute_stream.append(comp_bwd_task)
 
         # then, queue optimizer tasks
         for idx in range(len(self.compute_perf_model) - 1, -1, -1):
@@ -319,18 +331,11 @@ class OSDPExecutionSimulator:
         finish_time = {}
         pending_allgathers_fwd = 0
         # active_tasks = defaultdict(lambda: 0)
-
-        def get_task_stream(task):
-            task_name = task[0]
-            if "compute" in task_name or "optimizer" in task_name:
-                return TASKSTREAM_COMPUTE
-            else:
-                return TASKSTREAM_COMMS
-
         # a task is scheduable iff
         # (1) the task has all explicit dependencies resolved
         # (2) the task has all implicit dependencies resolved (single stream semantics)
         # (3) additional constraints such as number of inflight allgathers
+
         def schedulable(task):
             if task == self.dummy_event:
                 return False
@@ -349,8 +354,6 @@ class OSDPExecutionSimulator:
             return ready
 
         # this is a general implementation, for single stream execution this is not needed
-        timeline = SortedList()
-        curr_time = 0
         EVENT_SCHEDULED = 2
         EVENT_START = 1
         EVENT_END = 0  # prioritize end events
@@ -411,25 +414,55 @@ class OSDPExecutionSimulator:
             EVENT_SCHEDULED, TASKTYPE_ALLGATHER_FWD)] = event_start_allgather
         memory_profiler_hooks[(
             EVENT_SCHEDULED, TASKTYPE_ALLGATHER_BWD)] = event_start_allgather
-        
+
         # when does weight memory decrease?
         # when reducescatter has finished running
-        memory_profiler_hooks[(EVENT_END, TASKTYPE_REDUCESCATTER_BWD)] = event_end_reduce_scatter
+        memory_profiler_hooks[(
+            EVENT_END, TASKTYPE_REDUCESCATTER_BWD)] = event_end_reduce_scatter
 
         # when does activation memory increase?
         # when compute fwd is active
-        memory_profiler_hooks[(EVENT_START, TASKTYPE_COMPUTE_FWD)] = event_start_compute
+        memory_profiler_hooks[(
+            EVENT_START, TASKTYPE_COMPUTE_FWD)] = event_start_compute
 
         # when does gradient memory increase?
         # when backward compute is active
-        memory_profiler_hooks[(EVENT_START, TASKTYPE_COMPUTE_BWD)] = event_start_compute_bwd
-        
+        memory_profiler_hooks[(
+            EVENT_START, TASKTYPE_COMPUTE_BWD)] = event_start_compute_bwd
+
+        def get_task_stream(task):
+            task_name = task[0]
+            if "compute" in task_name or "optimizer" in task_name:
+                return TASKSTREAM_COMPUTE
+            else:
+                return TASKSTREAM_COMMS
+
+        def get_earliest_possible_schedule_time(task, proposal):
+            print(
+                f"[???] probing for schedule time {task}. proposal = {proposal}")
+            for dep in deps[task]:
+                proposal = max(proposal, finish_time[dep])
+                print(f"    dep: {dep}, finished = {finish_time[dep]}")
+
+            return proposal
+
+        timestamps = defaultdict(lambda: 0)
+
+        print(f"all dependencies {deps}")
+        print(
+            f"strategies = {[desc.sharding_strategy for desc in self.compute_perf_model]}")
+        print(f"comms stream = {comms_stream}")
+        print(f"comps stream = {compute_stream}")
+
+        timeline = SortedList()
 
         while comms_stream or compute_stream or timeline:
             # any task already queued?
             if timeline:
-                curr_time, event_status, curr_task = timeline.pop(0)
-                done_task_type, task_idx = curr_task
+                # timeline is an arbitrary serialization of
+                # execution of compute and comms stream.
+                schedule_ts, event_status, curr_task = timeline.pop(0)
+                done_task_type, _ = curr_task
                 if "allgather" in done_task_type:
                     if event_status == EVENT_START:
                         pending_allgathers_fwd += 1
@@ -439,34 +472,62 @@ class OSDPExecutionSimulator:
                 # is this a start event?
                 # if so, queue an event end
                 if event_status == EVENT_START:
+                    # catch up with global clock
+                    start_time = max(timestamps[get_task_stream(
+                        curr_task)], schedule_ts)
+
+                    end_time = start_time + self.get_latency(exec_env, curr_task)
+
                     timeline.add(
-                        curr_time + self.get_latency(exec_env, curr_task), EVENT_END, curr_task)
-                    memory_profiler_hooks[(EVENT_START, curr_task)]()
+                        (start_time + self.get_latency(exec_env, curr_task), EVENT_END, curr_task))
+                    memory_profiler_hooks[(EVENT_START, curr_task)](curr_task)
+                    # advance time stamp, because i know this stream
+                    # cannot do anything else between now and now + latency
+                    # advance my time so my task is not "preempted"
+                    print(f"[{start_time}] {curr_task} started. Will finish at {end_time}")
+
+                    timestamps[get_task_stream(
+                        curr_task)] = end_time
 
                 else:
                     # mark this task as done
-                    finish_time[curr_task] = curr_time
-                    memory_profiler_hooks[(EVENT_END, curr_task)]()
+                    finish_time[curr_task] = timestamps[get_task_stream(
+                        curr_task)]
+                    memory_profiler_hooks[(EVENT_END, curr_task)](curr_task)
+
+                    print(
+                        f"[{timestamps[get_task_stream(curr_task)]}] {curr_task} finished.")
 
             while compute_stream and schedulable(compute_stream[0]):
-                # issue at most one task per single stream semantics
-                # i can schedule it and I know when it finishes
                 comp_task = compute_stream.pop(0)
-                memory_profiler_hooks[(EVENT_SCHEDULED, comp_task)]()
+                memory_profiler_hooks[(EVENT_SCHEDULED, comp_task)](comp_task)
+                schedule_time = get_earliest_possible_schedule_time(
+                    comp_task, timestamps[TASKSTREAM_COMPUTE])
+
+                print(
+                    f"[{schedule_time}] scheduled comp task {comp_task}")
+
                 timeline.add(
-                    (curr_time, EVENT_START, comp_task))
+                    (schedule_time, EVENT_START, comp_task))
 
             while comms_stream and schedulable(comms_stream[0]):
-                # issue at most one task per single stream semantics
                 # issue as many comms tasks as possible
-                comms_task = comms_task.pop(0)
-                memory_profiler_hooks[(EVENT_SCHEDULED, comms_task)]()
+                comms_task = comms_stream.pop(0)
+                memory_profiler_hooks[(EVENT_SCHEDULED, comms_task)](
+                    comms_task)
+
+                schedule_time = get_earliest_possible_schedule_time(
+                    comms_task, timestamps[TASKSTREAM_COMMS])
+
+                print(
+                    f"[{schedule_time}] scheduled comms task {comms_task}")
+
                 timeline.add(
-                    (curr_time, EVENT_END, comms_task)
+                    (schedule_time, EVENT_START, comms_task)
                 )
 
         # optimizer and backward has a bogus dependency.
-        return curr_time, max_memory_usage
+        return max(timestamps.values()), max_memory_usage
 
 
 ### LOCAL TESTS ###
