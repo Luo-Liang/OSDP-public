@@ -367,9 +367,9 @@ class OSDPExecutionSimulator:
             return ready
 
         # this is a general implementation, for single stream execution this is not needed
-        EVENT_SCHEDULED = 2
-        EVENT_START = 1
-        EVENT_END = 0  # prioritize end events
+        EVENT_SCHEDULED = "2-SCHEDULED"
+        EVENT_START = "1-START"
+        EVENT_END = "0-FINISHED"  # prioritize end events
 
         # event-based memory profiling hooks
         ACTIVATION_MEMORY = "activation_memory"
@@ -513,7 +513,7 @@ class OSDPExecutionSimulator:
                     active_tasks[selected_stream].append(
                         (end_time, curr_task))
                     global_memory_profiling_timeline.add(
-                        (end_time, issue_q_order_tiebreaker, (
+                        (start_time, issue_q_order_tiebreaker, (
                             EVENT_START, curr_task))
                     )
                     issue_q_order_tiebreaker += 1
@@ -534,7 +534,7 @@ class OSDPExecutionSimulator:
                             EVENT_SCHEDULED, curr_task))
                     )
                     print(
-                        f"[{schedule_time}][{selected_stream}] task {curr_task} started. ")
+                        f"[{schedule_time}][{selected_stream}] task {curr_task} scheduled. ")
 
                     issue_q_order_tiebreaker += 1
 
@@ -545,6 +545,7 @@ class OSDPExecutionSimulator:
 
             _dbg_stream_symbol = "[GPU ]" if get_task_stream(
                 event_entry[1]) == TASKSTREAM_COMPUTE else "[RoCE]"
+
             print(
                 f"[{event_time}][{_dbg_stream_symbol}] {event_entry[0]} {event_entry[1]}")
 
