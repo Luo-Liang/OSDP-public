@@ -1,5 +1,6 @@
 from collections import defaultdict, deque
 from dataclasses import dataclass
+import random
 import sys
 from typing import ClassVar, List, Optional, Tuple
 import pandas
@@ -167,7 +168,6 @@ class ModuleExecutionDescriptor:
     @staticmethod
     def dbg__get_random_exec_desc():
         ModuleExecutionDescriptor.dbg__layer_variable += 1
-        import random
         return ModuleExecutionDescriptor(
             f"layer_{ModuleExecutionDescriptor.dbg__layer_variable}", random.randint(10, 100), "float", random.randint(10, 100), random.randint(10, 100), random.randint(10, 100), random.choice([x for x in ShardingStrategy]), random.randint(0, 100), random.randint(0, 100), "float")
 
@@ -461,11 +461,11 @@ class OSDPExecutionSimulator:
 
         timestamps = defaultdict(lambda: 0)
 
-        print(f"all dependencies {deps}")
-        print(
-            f"strategies = {[desc.sharding_strategy for desc in self.compute_perf_model]}")
-        print(f"comms stream = {comms_stream}")
-        print(f"comps stream = {compute_stream}")
+        # print(f"all dependencies {deps}")
+        # print(
+        #     f"strategies = {[desc.sharding_strategy for desc in self.compute_perf_model]}")
+        # print(f"comms stream = {comms_stream}")
+        # print(f"comps stream = {compute_stream}")
 
         issue_q_order_tiebreaker = 0
 
@@ -495,8 +495,8 @@ class OSDPExecutionSimulator:
                     )
                     issue_q_order_tiebreaker += 1
                     timestamps[selected_stream] = current_time
-                    print(
-                        f"[{current_time}][{selected_stream}] task {curr_task} finished")
+                    # print(
+                    #     f"[{current_time}][{selected_stream}] task {curr_task} finished")
                     # otherwise, see if anything in the ready queue, if so, issue them.
                 elif scheduled_tasks[selected_stream]:
                     # we can add to the corresponding queue
@@ -517,8 +517,8 @@ class OSDPExecutionSimulator:
                             EVENT_START, curr_task))
                     )
                     issue_q_order_tiebreaker += 1
-                    print(
-                        f"[{start_time}][{selected_stream}] task {curr_task} started")
+                    # print(
+                    #     f"[{start_time}][{selected_stream}] task {curr_task} started")
 
                 while named_streams[selected_stream] and schedulable(named_streams[selected_stream][0]):
                     curr_task = named_streams[selected_stream].pop(0)
@@ -533,8 +533,8 @@ class OSDPExecutionSimulator:
                         (schedule_time, issue_q_order_tiebreaker, (
                             EVENT_SCHEDULED, curr_task))
                     )
-                    print(
-                        f"[{schedule_time}][{selected_stream}] task {curr_task} scheduled. ")
+                    # print(
+                    #     f"[{schedule_time}][{selected_stream}] task {curr_task} scheduled. ")
 
                     issue_q_order_tiebreaker += 1
 
@@ -542,6 +542,8 @@ class OSDPExecutionSimulator:
         for log in global_memory_profiling_timeline:
             event_time, _, event_entry = log
             memory_profiler_hooks[event_entry](event_entry[1])
+
+            continue
 
             _dbg_stream_symbol = "[GPU ]" if get_task_stream(
                 event_entry[1]) == TASKSTREAM_COMPUTE else "[RoCE]"
@@ -560,7 +562,7 @@ ds_d = {
     "world_size": [float(x) for x in [1, 2, 3, 4, 5, 6, 7, 8]],
     "buffer_size": [float(x) for x in [4096, 8192, 2048, 1024, 4, 8, 16, 32]],
     "param_dtype": ["float"] * 8,
-    "latency": [1, 2, 0.5, 0.25, 0.001, 0.002, 0.004, 0.008],
+    "latency": [random.randint(1000, 2000) for _ in range(8)],
 }
 
 df = pandas.DataFrame(ds_d)
